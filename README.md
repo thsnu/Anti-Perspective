@@ -1,4 +1,4 @@
-# {ths} Anti-Perspective v1.00
+# Anti-Perspective v1.00
 
 Anti-Perspective removes perspective distortion from photos of flat surfaces — a poster on a wall, a book cover, a sign, a packaging mockup, a painting shot at an angle — and gives you back a clean, head-on version of it. Mark the four corners, and the straightened image appears next to it. From there you can squash, stretch or bend it to fit your layout, then export a transparent PNG.
 
