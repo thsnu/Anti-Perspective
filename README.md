@@ -10,6 +10,10 @@ result and export it as a transparent PNG.
 Anti-Perspective is a single-page browser tool with no build step, no dependencies and no server
 component. Images never leave your machine; everything runs in the canvas of your own browser.
 
+<img width="2668" height="1792" alt="Screenshot1" src="https://github.com/user-attachments/assets/263dedee-c6dd-4281-802e-2236c7b7fc3a" />
+<img width="2672" height="1794" alt="Screenshot2" src="https://github.com/user-attachments/assets/f1ed205a-6f7d-46eb-9a76-e12706c150b2" />
+<img width="2668" height="1790" alt="Screenshot3" src="https://github.com/user-attachments/assets/5e743f2f-9f63-439d-a05f-d27e37477df1" />
+
 ---
 
 ## What it does
@@ -97,7 +101,7 @@ python3 -m http.server 8731
 
 Then open <http://localhost:8731>.
 
-Opening `index.html` by double-click mostly works too, but some browsers restrict `getImageData`
+**Opening `index.html` by double-click mostly works too**, but some browsers restrict `getImageData`
 on `file://` URLs, which the rectification depends on — serving the folder avoids that entirely.
 
 ---
