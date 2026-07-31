@@ -94,7 +94,11 @@ https://thsnu.github.io/Anti-Perspective/
 
 ## Running it locally
 
-No build, no install:
+No build, no install.
+Download and **Opening `index.html` by double-click mostly works too**, but some browsers restrict `getImageData`
+on `file://` URLs, which the rectification depends on — serving the folder avoids that entirely.
+
+**Or starting your prefered server:**
 
 ```bash
 git clone https://github.com/<your-account>/anti-perspective.git
@@ -104,8 +108,7 @@ python3 -m http.server 8731
 
 Then open <http://localhost:8731>.
 
-**Opening `index.html` by double-click mostly works too**, but some browsers restrict `getImageData`
-on `file://` URLs, which the rectification depends on — serving the folder avoids that entirely.
+
 
 ---
 
