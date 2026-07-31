@@ -89,7 +89,10 @@ fixed preset is the safer choice.
 
 ---
 
-## Running it
+## Website
+https://thsnu.github.io/Anti-Perspective/
+
+## Running it locally
 
 No build, no install:
 
