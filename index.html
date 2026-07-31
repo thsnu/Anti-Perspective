@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{ths} Anti-Perspective</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <span class="brand">{ths} Anti&#8209;Perspective v1.0</span>
+  <label class="btn">Load image<input type="file" id="file" accept="image/*" hidden></label>
+  <button class="btn" id="resetQuad">Reset polygon</button>
+  <button class="btn" id="resetWarp">Reset warp</button>
+  <span class="sep"></span>
+  <div class="seg" id="mode">
+    <button data-mode="scale" class="on">Scale</button>
+    <button data-mode="warp">Mesh&#8209;warp</button>
+  </div>
+  <span class="sep"></span>
+  <label class="chk">Aspect ratio
+    <select id="aspect">
+      <option value="edges" selected>Edge averages</option>
+      <option value="auto">Automatic</option>
+      <option value="1.4142">√2 &mdash; A4 landscape</option>
+      <option value="0.7071">1/√2 &mdash; A4 portrait</option>
+      <option value="1.7778">16:9</option>
+      <option value="0.5625">9:16</option>
+      <option value="1.3333">4:3</option>
+      <option value="1.5">3:2</option>
+      <option value="1">1:1</option>
+    </select>
+  </label>
+  <span class="sep"></span>
+  <label class="chk"><input type="checkbox" id="showGrid"> Show mesh</label>
+</header>
+
+<!-- Its own fixed-height row: changing text lengths must not alter the
+     layout of the canvas areas. -->
+<div class="status">
+  <span class="info" id="info">No image loaded</span>
+  <span class="info" id="est"></span>
+</div>
+
+<main>
+  <section class="pane" id="paneL">
+    <div class="canvasWrap">
+      <div class="paneTitle">Source &mdash; set 4 corner points</div>
+      <canvas id="cvL"></canvas>
+      <div class="hint" id="hintL">Load an image or drop it here</div>
+    </div>
+    <div class="zoom"><button data-p="L" data-a="out">&minus;</button><span id="zL">100%</span><button data-p="L" data-a="in">+</button><button data-p="L" data-a="fit">Fit</button></div>
+  </section>
+
+  <div class="divider"></div>
+
+  <section class="pane" id="paneR">
+    <div class="canvasWrap">
+      <div class="paneTitle">Result &mdash; click for 8 handles</div>
+      <canvas id="cvR"></canvas>
+      <div class="hint" id="hintR">No 4 points set yet</div>
+    </div>
+    <div class="zoom"><button data-p="R" data-a="out">&minus;</button><span id="zR">100%</span><button data-p="R" data-a="in">+</button><button data-p="R" data-a="fit">Fit</button></div>
+  </section>
+</main>
+
+<footer>
+  <span class="keys"><b>Pan:</b> scroll&#8209;wheel click + drag, or drag empty stage &nbsp;·&nbsp; <b>Zoom:</b> scroll wheel &nbsp;·&nbsp; <b>M:</b> toggle mode &nbsp;·&nbsp; <b>Shift:</b> scale proportionally</span>
+  <span class="grow"></span>
+  <label class="chk">Export&#8209;scale
+    <select id="expScale">
+      <option value="0.5">50%</option>
+      <option value="1" selected>100%</option>
+      <option value="2">200%</option>
+    </select>
+  </label>
+  <button class="btn primary" id="export" disabled>Export PNG (transparent)</button>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
