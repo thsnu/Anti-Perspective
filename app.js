@@ -9,8 +9,13 @@ var S = {
   srcData: null,        // ImageData of the source
   srcW: 0, srcH: 0,
 
+  method: 'quad',       // 'quad' = 4 corner points, 'guided' = guide lines
   pts: [],              // up to 4 source points {x,y} in image coordinates
   ordered: false,       // order TL,TR,BR,BL already normalised
+
+  lines: [],            // guided mode: [{a:{x,y}, b:{x,y}, dir:'v'|'h'}] in image coordinates
+  hDst: null,           // guided mode: homography rectified -> source (9 values)
+  gInfo: null,          // guided mode: {method, f} of the most recent solution
 
   rectW: 0, rectH: 0,   // size of the rectified image
   rect: null,           // canvas holding the rectified image (full resolution)
@@ -30,6 +35,11 @@ var S = {
 
 var MAXPX = 4096;       // upper bound for the rectified image's edge length
 var PREVIEW = 900;      // preview resolution while dragging
+
+var GMAX = 4;           // guided mode: maximum number of guide lines
+var GMAG = 9;           // guided mode: how much the correction may magnify vs. the centre
+var GCOL = { v: '#29d17c', h: '#4da3ff' };
+var GCOLF = { v: 'rgba(41,209,124,.35)', h: 'rgba(77,163,255,.35)' };
 
 // ------------------------------------------------------------ DOM & Views
 
@@ -90,7 +100,7 @@ function homography(src, dst) {
 }
 
 function applyH(h, x, y) {
-  var w = h[6] * x + h[7] * y + 1;
+  var w = h[6] * x + h[7] * y + h[8];
   return { x: (h[0] * x + h[1] * y + h[2]) / w, y: (h[3] * x + h[4] * y + h[5]) / w };
 }
 
@@ -213,9 +223,263 @@ function estimateAspect(pts, imgW, imgH, fPx) {
   return { ratio: ratio, f: Math.sqrt(f2), method: method };
 }
 
+// ------------------------------------------------- Guided mode: line based
+
+function unit3(a) {
+  var m = Math.hypot(a[0], a[1], a[2]);
+  return m > 1e-12 ? [a[0] / m, a[1] / m, a[2] / m] : null;
+}
+function mul3(A, B) {
+  var C = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  for (var i = 0; i < 3; i++) for (var j = 0; j < 3; j++)
+    C[i][j] = A[i][0] * B[0][j] + A[i][1] * B[1][j] + A[i][2] * B[2][j];
+  return C;
+}
+function inv3(m) {
+  var a = m[0][0], b = m[0][1], c = m[0][2];
+  var d = m[1][0], e = m[1][1], f = m[1][2];
+  var g = m[2][0], h = m[2][1], i = m[2][2];
+  var A = e * i - f * h, B = f * g - d * i, C = d * h - e * g;
+  var det = a * A + b * B + c * C;
+  if (!det || !isFinite(det)) return null;
+  return [[A / det, (c * h - b * i) / det, (b * f - c * e) / det],
+          [B / det, (a * i - c * g) / det, (c * d - a * f) / det],
+          [C / det, (b * g - a * h) / det, (a * e - b * d) / det]];
+}
+function applyM(M, x, y) {
+  var w = M[2][0] * x + M[2][1] * y + M[2][2];
+  if (!w || !isFinite(w)) return null;
+  return { x: (M[0][0] * x + M[0][1] * y + M[0][2]) / w,
+           y: (M[1][0] * x + M[1][1] * y + M[1][2]) / w };
+}
+/* Local linearisation of M at (x,y) — tells us scale, rotation and mirroring. */
+function jacAt(M, x, y, eps) {
+  var p = applyM(M, x, y), px = applyM(M, x + eps, y), py = applyM(M, x, y + eps);
+  if (!p || !px || !py) return null;
+  var a00 = (px.x - p.x) / eps, a10 = (px.y - p.y) / eps;
+  var a01 = (py.x - p.x) / eps, a11 = (py.y - p.y) / eps;
+  return { a00: a00, a01: a01, a10: a10, a11: a11, det: a00 * a11 - a01 * a10 };
+}
+
+/* Smallest eigenvector of a symmetric 3x3 matrix (closed form). */
+function eigMinVec(M) {
+  var i, j;
+  var p1 = M[0][1] * M[0][1] + M[0][2] * M[0][2] + M[1][2] * M[1][2];
+  var q = (M[0][0] + M[1][1] + M[2][2]) / 3, lam;
+  if (p1 < 1e-24) {
+    lam = Math.min(M[0][0], M[1][1], M[2][2]);
+  } else {
+    var p2 = (M[0][0] - q) * (M[0][0] - q) + (M[1][1] - q) * (M[1][1] - q) +
+             (M[2][2] - q) * (M[2][2] - q) + 2 * p1;
+    var pp = Math.sqrt(p2 / 6);
+    var B = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    for (i = 0; i < 3; i++) for (j = 0; j < 3; j++) B[i][j] = (M[i][j] - (i === j ? q : 0)) / pp;
+    var r = (B[0][0] * (B[1][1] * B[2][2] - B[1][2] * B[2][1]) -
+             B[0][1] * (B[1][0] * B[2][2] - B[1][2] * B[2][0]) +
+             B[0][2] * (B[1][0] * B[2][1] - B[1][1] * B[2][0])) / 2;
+    r = Math.max(-1, Math.min(1, r));
+    lam = q + 2 * pp * Math.cos(Math.acos(r) / 3 + 2 * Math.PI / 3);   // smallest
+  }
+  var A = [[M[0][0] - lam, M[0][1], M[0][2]],
+           [M[1][0], M[1][1] - lam, M[1][2]],
+           [M[2][0], M[2][1], M[2][2] - lam]];
+  var best = null, bn = 0;
+  var cand = [cross(A[0], A[1]), cross(A[0], A[2]), cross(A[1], A[2])];
+  for (i = 0; i < 3; i++) {
+    var n = Math.hypot(cand[i][0], cand[i][1], cand[i][2]);
+    if (n > bn) { bn = n; best = cand[i]; }
+  }
+  return bn > 1e-18 ? unit3(best) : null;
+}
+
+/* Vanishing point of a bundle of lines: the point closest to all of them
+   (exact for two lines, least squares for more). */
+function vpFromLines(ls) {
+  if (ls.length < 2) return null;
+  if (ls.length === 2) return unit3(cross(ls[0], ls[1]));
+  var M = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], i, j;
+  ls.forEach(function (l) {
+    for (i = 0; i < 3; i++) for (j = 0; j < 3; j++) M[i][j] += l[i] * l[j];
+  });
+  return eigMinVec(M);
+}
+
+/* Clips a polygon against the half plane w(p) >= wmin, with w the third
+   (homogeneous) row of M — everything beyond it is behind the horizon. */
+function clipHalf(poly, M, wmin) {
+  var out = [], n = poly.length;
+  function f(p) { return M[2][0] * p.x + M[2][1] * p.y + M[2][2] - wmin; }
+  for (var i = 0; i < n; i++) {
+    var a = poly[i], b = poly[(i + 1) % n], fa = f(a), fb = f(b);
+    if (fa >= 0) out.push(a);
+    if ((fa >= 0) !== (fb >= 0)) {
+      var t = fa / (fa - fb);
+      out.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+    }
+  }
+  return out;
+}
+
+/* Builds the rectification from the guide lines.
+
+   Lines that ought to be vertical meet in the vertical vanishing point, the
+   horizontal ones in the horizontal vanishing point. If both are known and
+   compatible with a right angle, the orthogonality of the two directions
+   yields the focal length (Zhang & He, same idea as the aspect estimate) and
+   with it a full metric rectification — angles and the aspect ratio come out
+   right. Otherwise the vanishing line is mapped to infinity (that alone makes
+   the edges parallel) and an affine step turns the measured directions into
+   the vertical and the horizontal; the aspect ratio is then not recoverable.
+
+   Returns {W, H, h, info} — h maps rectified -> source. */
+function guidedRect() {
+  var i;
+  if (!S.img || S.lines.length < 2) return null;
+  var sc = Math.max(S.srcW, S.srcH) / 2, cx = S.srcW / 2, cy = S.srcH / 2;
+  var N = [[1 / sc, 0, -cx / sc], [0, 1 / sc, -cy / sc], [0, 0, 1]];   // px -> normalised
+
+  var lv = [], lh = [], pv = [], ph = [];
+  S.lines.forEach(function (L) {
+    var a = [(L.a.x - cx) / sc, (L.a.y - cy) / sc, 1];
+    var b = [(L.b.x - cx) / sc, (L.b.y - cy) / sc, 1];
+    if (Math.hypot(a[0] - b[0], a[1] - b[1]) < 1e-6) return;
+    var l = unit3(cross(a, b));
+    if (!l) return;
+    if (L.dir === 'v') { lv.push(l); pv.push([a, b]); } else { lh.push(l); ph.push([a, b]); }
+  });
+  if (lv.length + lh.length < 2) return null;
+
+  var Vv = vpFromLines(lv), Vh = vpFromLines(lh);
+  // a vanishing point at infinity means that bundle is already parallel in the
+  // picture — there is simply no perspective to undo in that direction
+  var finV = !!Vv && Math.abs(Vv[2]) > 1e-9, finH = !!Vh && Math.abs(Vh[2]) > 1e-9;
+  var Hn = null, info = null;
+
+  // 1) both vanishing points finite -> focal length -> metric rectification
+  if (finV && finH) {
+    var vx = Vv[0] / Vv[2], vy = Vv[1] / Vv[2];
+    var hx = Vh[0] / Vh[2], hy = Vh[1] / Vh[2];
+    var f2 = -(vx * hx + vy * hy);          // orthogonality, principal point at the centre
+    if (f2 > 1e-6) {
+      var f = Math.sqrt(f2);
+      var r1 = unit3([hx / f, hy / f, 1]);
+      var r2 = unit3([vx / f, vy / f, 1]);
+      var r3 = r1 && r2 ? unit3(cross(r1, r2)) : null;
+      if (r3) {
+        Hn = [[r1[0] / f, r1[1] / f, r1[2]],
+              [r2[0] / f, r2[1] / f, r2[2]],
+              [r3[0] / f, r3[1] / f, r3[2]]];       // R^T · K^-1
+        info = { method: 'metric', f: f * sc };
+      }
+    }
+  }
+
+  // 2) fallback: vanishing line to infinity, then align the directions
+  if (!Hn) {
+    var l;
+    if (Vv && Vh) l = cross(Vv, Vh);
+    else if (Vv) l = cross(Vv, [1, 0, 0]);          // assume horizontals already level
+    else if (Vh) l = cross(Vh, [0, 1, 0]);          // assume verticals already upright
+    else l = [0, 0, 1];
+    var ln = Math.hypot(l[0], l[1]);
+    if (ln > 1e-12 && Math.abs(l[2]) / ln < 0.05) return null;   // horizon through the centre
+    var Hp = Math.abs(l[2]) < 1e-12
+      ? [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+      : [[1, 0, 0], [0, 1, 0], [l[0] / l[2], l[1] / l[2], 1]];
+
+    var dir = function (pairs, want) {
+      var sx = 0, sy = 0;
+      pairs.forEach(function (pr) {
+        var p = applyM(Hp, pr[0][0], pr[0][1]), q = applyM(Hp, pr[1][0], pr[1][1]);
+        if (!p || !q) return;
+        var dx = q.x - p.x, dy = q.y - p.y, m = Math.hypot(dx, dy);
+        if (m < 1e-12) return;
+        dx /= m; dy /= m;
+        if (want === 'v' ? dy < 0 : dx < 0) { dx = -dx; dy = -dy; }
+        sx += dx; sy += dy;
+      });
+      var m2 = Math.hypot(sx, sy);
+      return m2 > 1e-9 ? [sx / m2, sy / m2] : null;
+    };
+    var dv = dir(pv, 'v'), dh = dir(ph, 'h');
+    if (!dv && !dh) return null;
+    if (!dh) dh = [dv[1], -dv[0]];
+    if (!dv) dv = [-dh[1], dh[0]];
+    var det = dh[0] * dv[1] - dv[0] * dh[1];
+    if (Math.abs(det) < 1e-4) return null;          // the two bundles are parallel
+    var g = Math.sqrt(Math.abs(det));               // keep the affine step area neutral
+    var A = [[dv[1] / det * g, -dv[0] / det * g, 0],
+             [-dh[1] / det * g, dh[0] / det * g, 0],
+             [0, 0, 1]];
+    Hn = mul3(A, Hp);
+    info = { method: (finV && finH) ? 'skew' : (finV || finH) ? 'keystone' : 'affine', f: null };
+  }
+
+  var M = mul3(Hn, N);                              // source px -> rectified (up to a similarity)
+
+  // normalise so the image centre has w = +1
+  var wc = M[2][0] * cx + M[2][1] * cy + M[2][2];
+  if (!isFinite(wc) || Math.abs(wc) < 1e-12) return null;
+  for (i = 0; i < 3; i++) for (var j = 0; j < 3; j++) M[i][j] /= wc;
+
+  // upright and unmirrored: the sign of the vanishing points is ambiguous
+  var eps = Math.max(S.srcW, S.srcH) / 1000;
+  var J = jacAt(M, cx, cy, eps);
+  if (!J || !J.det || !isFinite(J.det)) return null;
+  if (J.det < 0) { M = mul3([[-1, 0, 0], [0, 1, 0], [0, 0, 1]], M); J = jacAt(M, cx, cy, eps); }
+  if (!J) return null;
+  if (Math.abs(Math.atan2(J.a10, J.a00)) > Math.PI / 2) {
+    M = mul3([[-1, 0, 0], [0, -1, 0], [0, 0, 1]], M);
+    J = jacAt(M, cx, cy, eps);
+    if (!J) return null;
+  }
+
+  // the visible part: everything the correction does not blow up beyond GMAG
+  var poly = clipHalf([{ x: 0, y: 0 }, { x: S.srcW, y: 0 },
+                       { x: S.srcW, y: S.srcH }, { x: 0, y: S.srcH }],
+                      M, 1 / Math.sqrt(GMAG));
+  if (poly.length < 3) return null;
+  var x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (i = 0; i < poly.length; i++) {
+    var q2 = applyM(M, poly[i].x, poly[i].y);
+    if (!q2) return null;
+    x0 = Math.min(x0, q2.x); y0 = Math.min(y0, q2.y);
+    x1 = Math.max(x1, q2.x); y1 = Math.max(y1, q2.y);
+  }
+  var bw = x1 - x0, bh = y1 - y0;
+  if (!(bw > 0) || !(bh > 0) || !isFinite(bw) || !isFinite(bh)) return null;
+
+  // keep the resolution at the image centre, then cap the overall size
+  var k = 1 / Math.sqrt(Math.abs(J.det));
+  k *= Math.min(1, MAXPX / Math.max(bw * k, bh * k, 1));
+  var W = Math.max(1, Math.round(bw * k)), H = Math.max(1, Math.round(bh * k));
+
+  var F = mul3([[k, 0, -x0 * k], [0, k, -y0 * k], [0, 0, 1]], M);
+  var iv = inv3(F);
+  if (!iv) return null;
+  return {
+    W: W, H: H, info: info,
+    h: [iv[0][0], iv[0][1], iv[0][2], iv[1][0], iv[1][1], iv[1][2],
+        iv[2][0], iv[2][1], iv[2][2]]
+  };
+}
+
 // ------------------------------------------------------------------ Rectify
 
+/* Determines the size of the rectified image (and, in guided mode, the
+   mapping itself). false = the current input does not yield a rectification. */
 function calcRectSize() {
+  if (S.method === 'guided') {
+    var g = guidedRect();
+    S.est = null;
+    S.gInfo = g ? g.info : null;
+    S.hDst = g ? g.h : null;
+    if (!g) return false;
+    S.rectW = g.W; S.rectH = g.H;
+    return true;
+  }
+  S.hDst = null; S.gInfo = null;
+  if (S.pts.length !== 4) return false;
   var p = S.pts;
   var w = (len(p[0], p[1]) + len(p[3], p[2])) / 2;
   var h = (len(p[0], p[3]) + len(p[1], p[2])) / 2;
@@ -244,17 +508,28 @@ function calcRectSize() {
   var k = Math.min(1, MAXPX / Math.max(w, h, 1));
   S.rectW = Math.max(1, Math.round(w * k));
   S.rectH = Math.max(1, Math.round(h * k));
+  return true;
 }
 
 /* Builds the rectified canvas. scale<1 => fast preview. */
 function rectify(scale) {
-  if (S.pts.length !== 4 || !S.srcData) return;
+  if (!S.srcData) return false;
   var W = Math.max(1, Math.round(S.rectW * scale));
   var H = Math.max(1, Math.round(S.rectH * scale));
 
-  var dstRect = [{ x: 0, y: 0 }, { x: W, y: 0 }, { x: W, y: H }, { x: 0, y: H }];
-  var h = homography(dstRect, S.pts);       // target -> source (inverse mapping)
-  if (!h) return;
+  var h, r;
+  if (S.method === 'guided') {
+    if (!S.hDst) return false;
+    // the guided mapping is built for the full size: rescale its input axes
+    var kx = W / S.rectW, ky = H / S.rectH;
+    h = S.hDst.slice();
+    for (r = 0; r < 3; r++) { h[r * 3] /= kx; h[r * 3 + 1] /= ky; }
+  } else {
+    if (S.pts.length !== 4) return false;
+    var dstRect = [{ x: 0, y: 0 }, { x: W, y: 0 }, { x: W, y: H }, { x: 0, y: H }];
+    h = homography(dstRect, S.pts);         // target -> source (inverse mapping)
+  }
+  if (!h) return false;
 
   var out = document.createElement('canvas');
   out.width = W; out.height = H;
@@ -265,7 +540,7 @@ function rectify(scale) {
   for (var y = 0; y < H; y++) {
     for (var x = 0; x < W; x++) {
       var px = x + 0.5, py = y + 0.5;
-      var w0 = h[6] * px + h[7] * py + 1;
+      var w0 = h[6] * px + h[7] * py + h[8];
       var sx = (h[0] * px + h[1] * py + h[2]) / w0 - 0.5;
       var sy = (h[3] * px + h[4] * py + h[5]) / w0 - 0.5;
       var di = (y * W + x) * 4;
@@ -291,6 +566,7 @@ function rectify(scale) {
   oc.putImageData(od, 0, 0);
   S.rect = out;
   S.rectScale = W / S.rectW;
+  return true;
 }
 
 /* Carry the warp points along proportionally when the target size changes. */
@@ -303,12 +579,19 @@ function rescaleWarp(oldW, oldH) {
 
 function rebuildRect(preview) {
   var oldW = S.rectW, oldH = S.rectH;
-  calcRectSize();
+  if (!calcRectSize()) { S.rect = null; S.rectDirty = false; return false; }
   rescaleWarp(oldW, oldH);
   var sc = 1;
   if (preview) sc = Math.min(1, PREVIEW / Math.max(S.rectW, S.rectH));
-  rectify(sc);
+  if (!rectify(sc)) { S.rect = null; S.rectDirty = false; return false; }
   S.rectDirty = sc < 1;
+  return true;
+}
+
+/* Enough input for a rectification? (Whether it actually works out is
+   decided by calcRectSize.) */
+function sourceReady() {
+  return S.method === 'guided' ? S.lines.length >= 2 : S.pts.length === 4;
 }
 
 // ---------------------------------------------------------- Warp (Coons patch)
@@ -546,6 +829,8 @@ function drawLeft() {
   ctx.drawImage(S.img, 0, 0);
 
   ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (S.method === 'guided') { drawGuides(ctx, dpr, t, v); return; }
+
   var sp = S.pts.map(function (q) { return { x: q.x * t + v.ox * dpr, y: q.y * t + v.oy * dpr }; });
 
   if (sp.length > 1) {
@@ -568,6 +853,53 @@ function drawLeft() {
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText(String(i + 1), q.x, q.y + 0.5 * dpr);
   });
+}
+
+/* Guide lines: the drawn segment, its infinite extension as a sighting aid,
+   two end handles and a midpoint badge that carries the orientation. */
+function drawGuides(ctx, dpr, t, v) {
+  var far = Math.hypot(P.L.cv.width, P.L.cv.height) * 1.2;
+  S.lines.forEach(function (L) {
+    var a = { x: L.a.x * t + v.ox * dpr, y: L.a.y * t + v.oy * dpr };
+    var b = { x: L.b.x * t + v.ox * dpr, y: L.b.y * t + v.oy * dpr };
+    var col = GCOL[L.dir];
+    var dx = b.x - a.x, dy = b.y - a.y, m = Math.hypot(dx, dy) || 1;
+    dx /= m; dy /= m;
+
+    ctx.save();
+    ctx.setLineDash([5 * dpr, 5 * dpr]);
+    ctx.lineWidth = 1 * dpr;
+    ctx.strokeStyle = GCOLF[L.dir];
+    ctx.beginPath();
+    ctx.moveTo(a.x - dx * far, a.y - dy * far);
+    ctx.lineTo(b.x + dx * far, b.y + dy * far);
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.lineWidth = 2.5 * dpr;
+    ctx.strokeStyle = col;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+
+    handle(ctx, a.x, a.y, 5.5 * dpr, col, '#0d1912');
+    handle(ctx, b.x, b.y, 5.5 * dpr, col, '#0d1912');
+
+    var mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2, r = 7 * dpr;
+    ctx.fillStyle = col; ctx.strokeStyle = '#0d1912'; ctx.lineWidth = 2 * dpr;
+    ctx.beginPath(); ctx.rect(mx - r, my - r, r * 2, r * 2);
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#0d1912';
+    ctx.font = 'bold ' + (10 * dpr) + 'px sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(L.dir === 'v' ? 'V' : 'H', mx, my + 0.5 * dpr);
+  });
+}
+
+/* Flat lists for the hit test: both end points of every line, plus the
+   midpoints (index = line index). */
+function guideHandles() {
+  var ends = [], mids = [];
+  S.lines.forEach(function (L) { ends.push(L.a, L.b); mids.push(mid(L.a, L.b)); });
+  return { ends: ends, mids: mids };
 }
 
 function drawRight() {
@@ -642,22 +974,37 @@ function drawBez(ctx, sc, a, k, b) {
 
 function draw() { drawLeft(); drawRight(); updateChrome(); }
 
+function guidedCounts() {
+  var nv = 0;
+  S.lines.forEach(function (L) { if (L.dir === 'v') nv++; });
+  return { v: nv, h: S.lines.length - nv };
+}
+
 function updateChrome() {
+  var guided = S.method === 'guided';
   P.L.zoom.textContent = Math.round(viewL.s * 100) + '%';
   P.R.zoom.textContent = Math.round(viewR.s * 100) + '%';
   hintL.classList.toggle('off', !!S.img);
   hintR.classList.toggle('off', !!S.rect);
   if (!S.img) { hintR.textContent = 'No image yet'; }
-  else if (S.pts.length < 4) { hintR.textContent = 'Set ' + (4 - S.pts.length) + ' more point(s)'; }
+  else if (guided) {
+    hintR.textContent = S.lines.length < 2
+      ? 'Draw ' + (2 - S.lines.length) + ' more guide line(s)'
+      : 'These lines do not yield a correction';
+  } else if (S.pts.length < 4) { hintR.textContent = 'Set ' + (4 - S.pts.length) + ' more point(s)'; }
   expBtn.disabled = !S.rect;
   if (S.img) {
     var txt = S.srcW + '×' + S.srcH + ' px';
     if (S.rect) txt += '  →  ' + S.rectW + '×' + S.rectH + ' px';
-    if (S.pts.length < 4) txt += '  ·  ' + S.pts.length + '/4 points';
+    if (guided) {
+      var c = guidedCounts();
+      txt += '  ·  ' + c.v + ' vertical, ' + c.h + ' horizontal';
+    } else if (S.pts.length < 4) txt += '  ·  ' + S.pts.length + '/4 points';
     info.textContent = txt;
   } else info.textContent = 'No image loaded';
 
   var est = document.getElementById('est');
+  if (guided) { guidedStatus(est); return; }
   if (!S.rect || S.aspectMode !== 'auto') {
     est.textContent = ''; est.title = ''; est.classList.remove('warn'); return;
   }
@@ -685,6 +1032,47 @@ function updateChrome() {
       : S.est.method === 'affine'
         ? 'Near-parallel edges: no perspective information, estimated purely affinely.'
         : 'Focal length estimated from the four points. Unreliable for near-frontal shots.';
+  }
+}
+
+/* What the guided solution is actually based on — the difference between a
+   true metric rectification and a mere straightening matters for the result. */
+function guidedStatus(est) {
+  est.classList.remove('warn'); est.title = '';
+  if (!S.img || !S.lines.length) { est.textContent = ''; return; }
+  if (!S.rect) {
+    if (S.lines.length < 2) { est.textContent = 'At least two guide lines needed'; return; }
+    est.textContent = '⚠︎ These lines cannot be resolved';
+    est.classList.add('warn');
+    est.title = 'Two lines of the same orientation are (nearly) parallel or ' +
+                'meet inside the picture, so no usable correction follows from them.';
+    return;
+  }
+  var g = S.gInfo || {};
+  if (g.method === 'metric') {
+    var t = 'Guided · metric — both vanishing points';
+    if (g.f) {
+      var mm = S.srcW ? g.f / Math.max(S.srcW, S.srcH) * 36 : 0;
+      t += ' · f ≈ ' + Math.round(g.f) + ' px';
+      if (mm) t += ' ≙ ' + Math.round(mm) + ' mm';
+    }
+    est.textContent = t;
+    est.title = 'Vertical and horizontal vanishing points are compatible with a ' +
+                'right angle: angles and the aspect ratio are recovered.';
+  } else if (g.method === 'keystone') {
+    est.textContent = 'Guided · one direction — aspect ratio not recoverable';
+    est.title = 'Only one bundle of lines converges. The edges become parallel and ' +
+                'upright, but the second axis is assumed to be undistorted already. ' +
+                'Add two lines of the other orientation for a full correction.';
+  } else if (g.method === 'skew') {
+    est.textContent = '⚠︎ Guided · vanishing points not compatible with a right angle';
+    est.classList.add('warn');
+    est.title = 'The lines converge, but not the way a rectangular corner would. ' +
+                'Edges are straightened, the aspect ratio stays arbitrary.';
+  } else {
+    est.textContent = 'Guided · affine — rotation and shear only';
+    est.title = 'No bundle of two like-oriented lines: the picture is only rotated ' +
+                'and sheared so the drawn lines run vertically and horizontally.';
   }
 }
 
@@ -723,7 +1111,9 @@ function loadImage(src) {
     var cc = c.getContext('2d', { willReadFrequently: true });
     cc.drawImage(img, 0, 0);
     S.srcData = cc.getImageData(0, 0, S.srcW, S.srcH);
-    S.pts = []; S.rect = null; S.warp = null; S.warpHandles = false;
+    S.pts = []; S.lines = [];
+    S.rect = null; S.warp = null; S.warpHandles = false;
+    S.hDst = null; S.gInfo = null;
     fitView('L');
     draw();
   };
@@ -762,8 +1152,9 @@ function scheduleRebuild() {
   if (rebuildPending) return;
   rebuildPending = requestAnimationFrame(function () {
     rebuildPending = 0;
-    rebuildRect(true);
-    if (!S.warp) resetWarp();
+    var had = !!S.rect;
+    if (rebuildRect(true) && !S.warp) resetWarp();
+    if (!had && S.rect) fitView('R');       // first result: bring it into view
     draw();
   });
 }
@@ -811,6 +1202,7 @@ function onDown(which, e) {
 
   if (which === 'L') {
     if (!S.img) return;
+    if (S.method === 'guided') { downGuided(pos, world, v); return; }
     var i = hit(S.pts, world, v);
     if (i >= 0) { dragging = { pane: 'L', type: 'pt', idx: i }; return; }
     if (S.pts.length < 4) {
@@ -859,6 +1251,24 @@ function onDown(which, e) {
   draw();
 }
 
+/* Guided mode on the source pane: grab an end point, grab the midpoint
+   (move the line, or toggle its orientation on a plain click), otherwise
+   pull a new line open. */
+function downGuided(pos, world, v) {
+  var gh = guideHandles();
+  var ei = hit(gh.ends, world, v);
+  if (ei >= 0) { dragging = { pane: 'L', type: 'lend', li: ei >> 1, pi: ei & 1 }; return; }
+  var mi = hit(gh.mids, world, v);
+  if (mi >= 0) { dragging = { pane: 'L', type: 'lmid', li: mi, last: world, start: world, moved: false }; return; }
+  if (S.lines.length < GMAX) {
+    S.lines.push({ a: { x: world.x, y: world.y }, b: { x: world.x, y: world.y }, dir: 'v' });
+    dragging = { pane: 'L', type: 'lnew', li: S.lines.length - 1 };
+    draw();
+    return;
+  }
+  dragging = { pane: 'L', type: 'pan', sx: pos.x, sy: pos.y, ox: v.ox, oy: v.oy };
+}
+
 function onMove(which, e) {
   var p = P[which], v = p.view, pos = localPos(p.cv, e);
   var world = toWorld(v, pos.x, pos.y);
@@ -866,13 +1276,20 @@ function onMove(which, e) {
   if (!dragging || dragging.pane !== which) {
     // cursor feedback
     var over = false;
-    if (which === 'L' && S.img) over = hit(S.pts, world, v) >= 0;
+    if (which === 'L' && S.img) {
+      if (S.method === 'guided') {
+        var gh = guideHandles();
+        over = hit(gh.ends, world, v) >= 0 || hit(gh.mids, world, v) >= 0;
+      } else over = hit(S.pts, world, v) >= 0;
+    }
     if (which === 'R' && S.rect && S.warpHandles) {
       over = S.mode === 'warp'
         ? (hit(S.warp.c, world, v) >= 0 || hit(S.warp.m, world, v) >= 0)
         : hit(scaleHandles(), world, v) >= 0;
     }
-    p.cv.style.cursor = over ? 'grab' : (which === 'L' && S.img && S.pts.length < 4 ? 'crosshair' : 'default');
+    var free = which === 'L' && S.img &&
+      (S.method === 'guided' ? S.lines.length < GMAX : S.pts.length < 4);
+    p.cv.style.cursor = over ? 'grab' : (free ? 'crosshair' : 'default');
     return;
   }
 
@@ -887,6 +1304,29 @@ function onMove(which, e) {
 
   if (dragging.type === 'pt') {
     S.pts[dragging.idx] = { x: world.x, y: world.y };
+    scheduleRebuild();
+    return;
+  }
+
+  if (dragging.type === 'lnew' || dragging.type === 'lend') {
+    var gl = S.lines[dragging.li];
+    if (dragging.type === 'lnew') {
+      gl.b = { x: world.x, y: world.y };
+      // the drag direction decides what the line stands for
+      gl.dir = Math.abs(gl.b.y - gl.a.y) >= Math.abs(gl.b.x - gl.a.x) ? 'v' : 'h';
+    } else {
+      gl[dragging.pi ? 'b' : 'a'] = { x: world.x, y: world.y };
+    }
+    scheduleRebuild();
+    return;
+  }
+
+  if (dragging.type === 'lmid') {
+    var gm = S.lines[dragging.li];
+    var dm = { x: world.x - dragging.last.x, y: world.y - dragging.last.y };
+    dragging.last = world;
+    if (len(world, dragging.start) * v.s > 3) dragging.moved = true;
+    gm.a.x += dm.x; gm.a.y += dm.y; gm.b.x += dm.x; gm.b.y += dm.y;
     scheduleRebuild();
     return;
   }
@@ -925,15 +1365,34 @@ function onMove(which, e) {
 
 function onUp(which) {
   if (!dragging) return;
-  var t = dragging.type;
+  var d = dragging, t = d.type;
   dragging = null;
-  if (t === 'pt') {
+
+  if (t === 'lnew' && len(S.lines[d.li].a, S.lines[d.li].b) * viewL.s < 10) {
+    S.lines.splice(d.li, 1);                // a stray click, not a line
+  }
+  if (t === 'lmid' && !d.moved) {           // plain click toggles the orientation
+    var L = S.lines[d.li];
+    L.dir = L.dir === 'v' ? 'h' : 'v';
+  }
+
+  if (t === 'pt' || t === 'lnew' || t === 'lend' || t === 'lmid') {
     if (rebuildPending) { cancelAnimationFrame(rebuildPending); rebuildPending = 0; }
-    rebuildRect(false);                     // full resolution once released
-    if (!S.warp) resetWarp();
+    // a new line changes the framing completely — merely dragging one does not
+    refreshResult(!S.rect || t === 'lnew');   // full resolution once released
   }
   if (t === 'maybePan') { /* plain click: handles stay visible */ }
   draw();
+}
+
+/* Rebuilds the right-hand pane from the current source input. */
+function refreshResult(refit) {
+  if (sourceReady() && rebuildRect(false)) {
+    if (!S.warp) resetWarp();
+    if (refit) fitView('R');
+  } else {
+    S.rect = null; S.warp = null; S.warpHandles = false;
+  }
 }
 
 ['L', 'R'].forEach(function (k) {
@@ -961,18 +1420,47 @@ document.querySelectorAll('.zoom button').forEach(function (b) {
 });
 
 document.getElementById('resetQuad').addEventListener('click', function () {
-  S.pts = []; S.rect = null; S.warp = null; S.warpHandles = false; draw();
+  if (S.method === 'guided') S.lines = []; else S.pts = [];
+  S.rect = null; S.warp = null; S.warpHandles = false;
+  S.hDst = null; S.gInfo = null;
+  draw();
 });
 document.getElementById('resetWarp').addEventListener('click', function () {
   if (S.rect) { resetWarp(); fitView('R'); draw(); }
 });
 document.getElementById('aspect').addEventListener('change', function (e) {
   S.aspectMode = e.target.value;
-  if (S.pts.length === 4) { rebuildRect(false); fitView('R'); }
+  if (S.method !== 'guided' && S.pts.length === 4) { rebuildRect(false); fitView('R'); }
   draw();
 });
 document.getElementById('showGrid').addEventListener('change', function (e) {
   S.showGrid = e.target.checked; draw();
+});
+
+/* The two ways to define the correction are entirely separate: each keeps its
+   own input, switching only rebuilds the result from the other one. */
+function setMethod(m) {
+  if (S.method === m) return;
+  S.method = m;
+  S.rect = null; S.warp = null; S.warpHandles = false;
+  S.hDst = null; S.gInfo = null; S.est = null;
+  document.querySelectorAll('#method button').forEach(function (b) {
+    b.classList.toggle('on', b.dataset.method === m);
+  });
+  var guided = m === 'guided';
+  document.getElementById('aspect').disabled = guided;
+  document.getElementById('resetQuad').textContent = guided ? 'Reset lines' : 'Reset polygon';
+  document.getElementById('titleL').innerHTML = guided
+    ? 'Source &mdash; draw 2&ndash;4 guide lines'
+    : 'Source &mdash; set 4 corner points';
+  hintL.textContent = S.img
+    ? (guided ? 'Drag along an edge that should be vertical or horizontal' : '')
+    : 'Load an image or drop it here';
+  refreshResult(true);
+  draw();
+}
+document.querySelectorAll('#method button').forEach(function (b) {
+  b.addEventListener('click', function () { setMethod(b.dataset.method); });
 });
 
 function setMode(m) {
@@ -990,6 +1478,13 @@ window.addEventListener('keydown', function (e) {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
   if (e.key === 'Escape') { S.warpHandles = false; draw(); }
   if (e.key === 'm' || e.key === 'M') setMode(S.mode === 'scale' ? 'warp' : 'scale');
+  if (e.key === 'g' || e.key === 'G') setMethod(S.method === 'quad' ? 'guided' : 'quad');
+  if (S.method === 'guided' && (e.key === 'Backspace' || e.key === 'Delete') && S.lines.length) {
+    e.preventDefault();
+    S.lines.pop();
+    refreshResult(true);
+    draw();
+  }
 });
 
 // ------------------------------------------------------------------ Export

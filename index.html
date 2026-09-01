@@ -8,8 +8,14 @@
 <body>
 
 <header>
-  <span class="brand">{ths} Anti&#8209;Perspective v1.0</span>
+  <span class="brand">{ths} Anti&#8209;Perspective v1.1</span>
   <label class="btn">Load image<input type="file" id="file" accept="image/*" hidden></label>
+  <span class="sep"></span>
+  <div class="seg" id="method">
+    <button data-method="quad" class="on">Corners</button>
+    <button data-method="guided">Guided</button>
+  </div>
+  <span class="sep"></span>
   <button class="btn" id="resetQuad">Reset polygon</button>
   <button class="btn" id="resetWarp">Reset warp</button>
   <span class="sep"></span>
@@ -45,7 +51,7 @@
 <main>
   <section class="pane" id="paneL">
     <div class="canvasWrap">
-      <div class="paneTitle">Source &mdash; set 4 corner points</div>
+      <div class="paneTitle" id="titleL">Source &mdash; set 4 corner points</div>
       <canvas id="cvL"></canvas>
       <div class="hint" id="hintL">Load an image or drop it here</div>
     </div>
@@ -65,7 +71,7 @@
 </main>
 
 <footer>
-  <span class="keys"><b>Pan:</b> scroll&#8209;wheel click + drag, or drag empty stage &nbsp;·&nbsp; <b>Zoom:</b> scroll wheel &nbsp;·&nbsp; <b>M:</b> toggle mode &nbsp;·&nbsp; <b>Shift:</b> scale proportionally</span>
+  <span class="keys"><b>Pan:</b> scroll&#8209;wheel click + drag, or drag empty stage &nbsp;·&nbsp; <b>Zoom:</b> scroll wheel &nbsp;·&nbsp; <b>G:</b> Corners / Guided &nbsp;·&nbsp; <b>M:</b> toggle mode &nbsp;·&nbsp; <b>Shift:</b> scale proportionally &nbsp;·&nbsp; <b>Guided:</b> click a badge to flip V/H, <b>Backspace</b> deletes the last line</span>
   <span class="grow"></span>
   <label class="chk">Export&#8209;scale
     <select id="expScale">

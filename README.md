@@ -16,6 +16,19 @@ component. Images never leave your machine; everything runs in the canvas of you
 
 ---
 
+## Two ways to define the correction
+
+The `Corners` / `Guided` switch in the toolbar picks how the perspective is derived. Both work
+completely independently and keep their own input, so you can switch back and forth without losing
+anything — the right-hand pane, the warp modes and the export behave identically either way.
+
+- **Corners** (default) — mark the four corners of a rectangle. Best when you want to *lift a flat
+  surface out of* a photo: a poster, a book cover, a label.
+- **Guided** — draw lines along edges that ought to be vertical or horizontal. Best when you want
+  to *straighten the whole photo*: converging building edges, a tilted horizon, keystoning.
+
+---
+
 ## What it does
 
 **Left pane — the source.** Load an image, then click four times to mark the corners of the
@@ -38,6 +51,39 @@ visual outline of the shape, curves included.
 
 **Export.** PNG with a transparent background, cropped exactly to the bounding box of the warped
 shape, at 50 %, 100 % or 200 % scale.
+
+---
+
+## Guided mode
+
+Drag along an edge that should be straight — a building corner, a door frame, a window sill, the
+horizon. The drag direction decides what the line stands for: steeper than 45° makes it a
+**vertical** guide (green), flatter makes it **horizontal** (blue). Click the `V`/`H` badge at the
+middle of a line to flip it, drag the badge to move the whole line, drag either end to adjust it.
+`Backspace` removes the last line, `Reset lines` clears them all. Two to four lines, in any mix.
+
+A dashed extension runs through each line across the whole canvas, which makes it easy to check
+that a short segment really is aligned with a long edge.
+
+The result is the *entire* image rectified, not a cut-out rectangle: everything the correction
+would blow up beyond nine times the magnification of the image centre is cropped away, so a horizon
+inside the frame does not produce an infinitely large canvas. The resolution at the image centre is
+preserved, capped at 4096 px per edge.
+
+**What the status bar reports.** How much can be recovered depends on what the lines give away:
+
+| Reported | Situation | Result |
+|---|---|---|
+| `metric` | Two vertical *and* two horizontal lines, converging like a real rectangular corner | Full correction. The two vanishing points must be orthogonal, which fixes the focal length (reported in px and 35 mm equivalent) and with it angles **and** the aspect ratio. |
+| `one direction` | Only one bundle of two like-oriented lines | The edges become parallel and upright, but the other axis is assumed to be undistorted already, so the aspect ratio stays off. Classic keystone correction — add two lines of the other orientation for the full fix. |
+| `affine` | Single lines, or edges that are already parallel | No perspective information at all: the picture is only rotated and sheared until the drawn lines run vertically and horizontally. |
+| ⚠ `not compatible with a right angle` | Both bundles converge, but not the way a rectangular corner would | Edges are straightened, the aspect ratio stays arbitrary. Usually means a line is misplaced, or the two directions are not actually perpendicular in the world. |
+
+Lines of the same orientation that are (nearly) identical, or that meet inside the picture, carry
+no usable information — the status bar says so instead of producing nonsense. More than two lines
+of one orientation are combined by least squares, so an imprecise line is averaged out rather than
+taken literally. The `Aspect ratio` selector belongs to corner mode and is disabled here: guided
+mode derives the geometry itself.
 
 ---
 
@@ -77,7 +123,11 @@ fixed preset is the safer choice.
 | Action | Input |
 |---|---|
 | Load an image | Toolbar button, or drop the file on the left pane |
+| Switch Corners / Guided | `G`, or the toolbar segment |
 | Set a corner point | Click the source image (first four clicks) |
+| Draw a guide line | Drag along an edge (guided mode, up to four) |
+| Flip a line V / H | Click its badge |
+| Delete the last line | `Backspace` |
 | Move a handle | Drag it |
 | Pan the canvas | Scroll-wheel click + drag, or drag an empty area |
 | Zoom the stage | Scroll wheel (zooms toward the cursor) |
@@ -124,6 +174,13 @@ Then open <http://localhost:8731>.
   Béziers. It is rendered as a textured triangle mesh — each triangle is clipped and drawn under
   its own affine transform, with the clip region slightly widened so no seams show. The transparent
   background comes for free.
+- **Guided rectification.** Each bundle of like-oriented lines is intersected in its vanishing
+  point (least squares via the smallest eigenvector of ∑ llᵀ for more than two lines). If both
+  vanishing points are finite, their orthogonality yields the focal length, and the camera rotation
+  built from them gives a metric rectification `Rᵀ·K⁻¹`. Otherwise the vanishing line is mapped to
+  infinity, which makes the edges parallel, and an affine step turns the measured directions into
+  the vertical and the horizontal. The result is normalised to be upright and unmirrored, clipped
+  against the horizon and then sampled by the same inverse-mapping loop as corner mode.
 - **Export** re-renders the same mesh at a finer subdivision into an offscreen canvas sized to the
   shape's bounding box.
 
