@@ -13,6 +13,8 @@ component. Images never leave your machine; everything runs in the canvas of you
 <img width="2668" height="1792" alt="Screenshot1" src="https://github.com/user-attachments/assets/263dedee-c6dd-4281-802e-2236c7b7fc3a" />
 <img width="2672" height="1794" alt="Screenshot2" src="https://github.com/user-attachments/assets/f1ed205a-6f7d-46eb-9a76-e12706c150b2" />
 <img width="2668" height="1790" alt="Screenshot3" src="https://github.com/user-attachments/assets/5e743f2f-9f63-439d-a05f-d27e37477df1" />
+<img width="1920" height="1255" alt="sceeenshot2" src="https://github.com/user-attachments/assets/51ac73ad-cc1f-4a90-86cc-f9839070d2bb" />
+
 
 ---
 
