@@ -28,6 +28,8 @@ var S = {
   aspectMode: 'edges',  // 'edges' | 'auto' | number as string (fixed ratio)
   name: '',             // source file name without extension, used for the export
   f35: null,            // focal length (35 mm equivalent) from EXIF
+  file: null,           // the loaded File — guards async steps against a newer load
+  icc: null,            // embedded colour profile: {data, name, space, bare} (bare = file without it)
   est: null,            // result of the most recent estimate
 
   showGrid: false
@@ -171,6 +173,186 @@ function readTiff(dv, base) {
   if (exifPtr == null) return null;
   var f35 = findTag(base + exifPtr, 0xA405);              // FocalLengthIn35mmFilm
   return (f35 && isFinite(f35) && f35 > 0) ? f35 : null;
+}
+
+// ------------------------------------------------- Colour profile (ICC)
+
+/* The browser colour-manages every image it decodes: the canvas receives sRGB
+   values, anything outside sRGB is clipped, and the PNG it writes is sRGB.
+   To keep the original profile, the export works on the *unconverted* values
+   instead: the profile is cut out of a copy of the file, so the browser takes
+   the pixels as sRGB and passes them through untouched, and the profile is
+   written back into the exported PNG. The panes keep showing the
+   colour-managed original. Supported containers: JPEG, PNG, WebP. */
+
+var ICC_OK = typeof CompressionStream === 'function' && typeof DecompressionStream === 'function';
+
+function ascii(u8, o, n) {
+  var s = '';
+  for (var i = 0; i < n && o + i < u8.length; i++) s += String.fromCharCode(u8[o + i]);
+  return s;
+}
+function u32be(u8, o) { return ((u8[o] << 24) | (u8[o + 1] << 16) | (u8[o + 2] << 8) | u8[o + 3]) >>> 0; }
+function u32le(u8, o) { return (u8[o] | (u8[o + 1] << 8) | (u8[o + 2] << 16) | (u8[o + 3] << 24)) >>> 0; }
+
+function concatBytes(parts) {
+  var n = 0, i, o = 0;
+  for (i = 0; i < parts.length; i++) n += parts[i].length;
+  var out = new Uint8Array(n);
+  for (i = 0; i < parts.length; i++) { out.set(parts[i], o); o += parts[i].length; }
+  return out;
+}
+
+/* Runs bytes through a (De)CompressionStream. 'deflate' is the zlib format PNG uses. */
+function pipeBytes(u8, stream) {
+  return new Response(new Blob([u8]).stream().pipeThrough(stream)).arrayBuffer()
+    .then(function (b) { return new Uint8Array(b); });
+}
+
+/* JPEG: the profile sits in APP2 segments tagged "ICC_PROFILE\0", possibly
+   split across several of them (sequence number, count, data). */
+function jpegSplitIcc(u8) {
+  if (u8[0] !== 0xFF || u8[1] !== 0xD8) return null;
+  var off = 2, n = u8.length, parts = [u8.subarray(0, 2)], keep = 2, chunks = [];
+  while (off + 4 <= n) {
+    if (u8[off] !== 0xFF) return null;
+    var m = u8[off + 1];
+    if (m === 0xFF) { off++; continue; }                  // fill byte
+    if (m === 0xDA || m === 0xD9) break;                  // image data follows
+    if (m === 0x01 || (m >= 0xD0 && m <= 0xD7)) { off += 2; continue; }
+    var end = off + 2 + ((u8[off + 2] << 8) | u8[off + 3]);
+    if (m === 0xE2 && end - off >= 18 && ascii(u8, off + 4, 12) === 'ICC_PROFILE\0') {
+      chunks.push({ seq: u8[off + 16], data: u8.subarray(off + 18, end) });
+      parts.push(u8.subarray(keep, off));
+      keep = end;
+    }
+    off = end;
+  }
+  if (!chunks.length) return null;
+  parts.push(u8.subarray(keep));
+  chunks.sort(function (a, b) { return a.seq - b.seq; });
+  return { icc: concatBytes(chunks.map(function (c) { return c.data; })), bare: concatBytes(parts) };
+}
+
+/* PNG chunks that describe the colour space — all of them go, otherwise the
+   browser would still convert the "bare" copy (or the export would carry two
+   contradicting descriptions). */
+var PNG_COLOR = { iCCP: 1, sRGB: 1, gAMA: 1, cHRM: 1, cICP: 1 };
+
+/* PNG: zlib-compressed profile in the iCCP chunk. Returns a promise. */
+function pngSplitIcc(u8) {
+  if (u32be(u8, 0) !== 0x89504E47 || u32be(u8, 4) !== 0x0D0A1A0A) return null;
+  var off = 8, parts = [u8.subarray(0, 8)], comp = null;
+  while (off + 12 <= u8.length) {
+    var len = u32be(u8, off), type = ascii(u8, off + 4, 4), end = off + 12 + len;
+    if (end > u8.length) return null;
+    if (type === 'iCCP') {
+      var p = off + 8, q = p;
+      while (q < p + len && u8[q]) q++;                   // profile name, 0-terminated
+      comp = u8.subarray(q + 2, p + len);                 // skip terminator + compression method
+    }
+    if (!PNG_COLOR[type]) parts.push(u8.subarray(off, end));
+    off = end;
+    if (type === 'IEND') break;
+  }
+  if (!comp) return null;
+  return pipeBytes(comp, new DecompressionStream('deflate'))
+    .then(function (icc) { return { icc: icc, bare: concatBytes(parts) }; });
+}
+
+/* WebP: an ICCP chunk inside the RIFF container, announced by a flag in VP8X. */
+function webpSplitIcc(u8) {
+  if (ascii(u8, 0, 4) !== 'RIFF' || ascii(u8, 8, 4) !== 'WEBP') return null;
+  var off = 12, parts = [], icc = null;
+  while (off + 8 <= u8.length) {
+    var type = ascii(u8, off, 4), len = u32le(u8, off + 4);
+    var end = Math.min(u8.length, off + 8 + len + (len & 1));
+    if (type === 'ICCP') icc = u8.slice(off + 8, off + 8 + len);
+    else {
+      var c = u8.slice(off, end);
+      if (type === 'VP8X') c[8] &= ~0x20;                 // clear the "has ICC" flag
+      parts.push(c);
+    }
+    off = end;
+  }
+  if (!icc) return null;
+  var body = concatBytes(parts), head = u8.slice(0, 12), size = body.length + 4;
+  head[4] = size & 255; head[5] = (size >> 8) & 255; head[6] = (size >> 16) & 255; head[7] = size >>> 24;
+  return { icc: icc, bare: concatBytes([head, body]) };
+}
+
+/* Resolves to {icc, bare} or null (no profile, unknown container, damaged file). */
+function splitIcc(u8) {
+  return Promise.resolve()
+    .then(function () { return jpegSplitIcc(u8) || pngSplitIcc(u8) || webpSplitIcc(u8); })
+    .catch(function () { return null; });
+}
+
+/* Header data colour space ('RGB ', 'GRAY', 'CMYK', ...) and the profile's
+   description, from the 'desc' tag (ICC v2 'desc' or v4 'mluc'). */
+function iccInfo(icc) {
+  if (icc.length < 132 || ascii(icc, 36, 4) !== 'acsp') return null;
+  var name = '';
+  try {
+    var count = u32be(icc, 128);
+    for (var i = 0; i < count && 144 + i * 12 <= icc.length; i++) {
+      var e = 132 + i * 12;
+      if (ascii(icc, e, 4) !== 'desc') continue;
+      var o = u32be(icc, e + 4), t = ascii(icc, o, 4);
+      if (t === 'desc') name = ascii(icc, o + 12, Math.max(0, u32be(icc, o + 8) - 1));
+      else if (t === 'mluc' && u32be(icc, o + 8) > 0) {
+        var sl = u32be(icc, o + 20), so = o + u32be(icc, o + 24);
+        for (var k = 0; k + 1 < sl; k += 2) name += String.fromCharCode((icc[so + k] << 8) | icc[so + k + 1]);
+      }
+      break;
+    }
+  } catch (err) { name = ''; }
+  name = name.replace(/[\x00-\x1f]/g, '').trim();
+  return { space: ascii(icc, 16, 4), name: name || 'ICC profile' };
+}
+
+var CRC_TABLE = (function () {
+  var t = new Uint32Array(256);
+  for (var n = 0; n < 256; n++) {
+    var c = n;
+    for (var k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+function pngChunk(type, data) {
+  var out = new Uint8Array(12 + data.length), i, c = 0xFFFFFFFF;
+  var n = data.length;
+  out[0] = n >>> 24; out[1] = (n >> 16) & 255; out[2] = (n >> 8) & 255; out[3] = n & 255;
+  for (i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+  out.set(data, 8);
+  for (i = 4; i < 8 + n; i++) c = CRC_TABLE[(c ^ out[i]) & 255] ^ (c >>> 8);
+  c = (c ^ 0xFFFFFFFF) >>> 0;
+  out[8 + n] = c >>> 24; out[9 + n] = (c >> 16) & 255; out[10 + n] = (c >> 8) & 255; out[11 + n] = c & 255;
+  return out;
+}
+
+/* Replaces whatever colour description the browser wrote with an iCCP chunk
+   carrying the original profile (placed right after IHDR, as PNG requires). */
+function pngWithIcc(png, icc, name) {
+  // profile name: Latin-1, 1–79 characters, no leading/trailing/double spaces
+  var nm = String(name).replace(/[^\x20-\x7e\xa1-\xff]/g, '').replace(/ +/g, ' ').trim().slice(0, 79).trim();
+  if (!nm) nm = 'ICC profile';
+  return pipeBytes(icc, new CompressionStream('deflate')).then(function (z) {
+    var head = new Uint8Array(nm.length + 2);             // name, terminator, method 0 (deflate)
+    for (var i = 0; i < nm.length; i++) head[i] = nm.charCodeAt(i);
+    var iccp = pngChunk('iCCP', concatBytes([head, z]));
+    var off = 8, parts = [png.subarray(0, 8)];
+    while (off + 12 <= png.length) {
+      var type = ascii(png, off + 4, 4), end = off + 12 + u32be(png, off);
+      if (!PNG_COLOR[type]) parts.push(png.subarray(off, end));
+      if (type === 'IHDR') parts.push(iccp);
+      off = end;
+      if (type === 'IEND') break;
+    }
+    return concatBytes(parts);
+  });
 }
 
 // ----------------------------------- Estimate aspect ratio (Zhang & He 2003)
@@ -511,31 +693,33 @@ function calcRectSize() {
   return true;
 }
 
-/* Builds the rectified canvas. scale<1 => fast preview. */
-function rectify(scale) {
-  if (!S.srcData) return false;
+/* Builds the rectified canvas from the given source pixels (the colour-managed
+   S.srcData, or the untouched values for the export). scale<1 => fast preview.
+   Returns the canvas, or null. */
+function rectify(scale, src) {
+  if (!src) return null;
   var W = Math.max(1, Math.round(S.rectW * scale));
   var H = Math.max(1, Math.round(S.rectH * scale));
 
   var h, r;
   if (S.method === 'guided') {
-    if (!S.hDst) return false;
+    if (!S.hDst) return null;
     // the guided mapping is built for the full size: rescale its input axes
     var kx = W / S.rectW, ky = H / S.rectH;
     h = S.hDst.slice();
     for (r = 0; r < 3; r++) { h[r * 3] /= kx; h[r * 3 + 1] /= ky; }
   } else {
-    if (S.pts.length !== 4) return false;
+    if (S.pts.length !== 4) return null;
     var dstRect = [{ x: 0, y: 0 }, { x: W, y: 0 }, { x: W, y: H }, { x: 0, y: H }];
     h = homography(dstRect, S.pts);         // target -> source (inverse mapping)
   }
-  if (!h) return false;
+  if (!h) return null;
 
   var out = document.createElement('canvas');
   out.width = W; out.height = H;
   var oc = out.getContext('2d');
   var od = oc.createImageData(W, H);
-  var o = od.data, sd = S.srcData.data, sw = S.srcW, sh = S.srcH;
+  var o = od.data, sd = src.data, sw = S.srcW, sh = S.srcH;
 
   for (var y = 0; y < H; y++) {
     for (var x = 0; x < W; x++) {
@@ -564,9 +748,7 @@ function rectify(scale) {
     }
   }
   oc.putImageData(od, 0, 0);
-  S.rect = out;
-  S.rectScale = W / S.rectW;
-  return true;
+  return out;
 }
 
 /* Carry the warp points along proportionally when the target size changes. */
@@ -583,7 +765,10 @@ function rebuildRect(preview) {
   rescaleWarp(oldW, oldH);
   var sc = 1;
   if (preview) sc = Math.min(1, PREVIEW / Math.max(S.rectW, S.rectH));
-  if (!rectify(sc)) { S.rect = null; S.rectDirty = false; return false; }
+  var r = rectify(sc, S.srcData);
+  if (!r) { S.rect = null; S.rectDirty = false; return false; }
+  S.rect = r;
+  S.rectScale = r.width / S.rectW;
   S.rectDirty = sc < 1;
   return true;
 }
@@ -731,11 +916,13 @@ function drawTri(ctx, img, s, d, pad) {
 }
 
 /* Draws the warped image into the current (already transformed) context.
-   Output coordinates = warp space. pad is given in warp units. */
-function drawWarped(ctx, N, pad) {
-  if (!S.rect) return;
+   Output coordinates = warp space. pad is given in warp units. tex defaults
+   to S.rect (the export passes the unconverted variant). */
+function drawWarped(ctx, N, pad, tex) {
+  tex = tex || S.rect;
+  if (!tex) return;
   var e = warpEdges();
-  var texW = S.rect.width, texH = S.rect.height;   // texture pixels (possibly preview resolution)
+  var texW = tex.width, texH = tex.height;         // texture pixels (possibly preview resolution)
 
   var grid = [], i, j;
   for (j = 0; j <= N; j++) {
@@ -748,9 +935,9 @@ function drawWarped(ctx, N, pad) {
       var u0 = i / N * texW, u1 = (i + 1) / N * texW;
       var v0 = j / N * texH, v1 = (j + 1) / N * texH;
       var A = grid[j][i], B = grid[j][i + 1], C = grid[j + 1][i + 1], D = grid[j + 1][i];
-      drawTri(ctx, S.rect, [u0, v0, u1, v0, u1, v1],
+      drawTri(ctx, tex, [u0, v0, u1, v0, u1, v1],
         [A.x, A.y, B.x, B.y, C.x, C.y], pad);
-      drawTri(ctx, S.rect, [u0, v0, u1, v1, u0, v1],
+      drawTri(ctx, tex, [u0, v0, u1, v1, u0, v1],
         [A.x, A.y, C.x, C.y, D.x, D.y], pad);
     }
   }
@@ -1000,8 +1187,16 @@ function updateChrome() {
       var c = guidedCounts();
       txt += '  ·  ' + c.v + ' vertical, ' + c.h + ' horizontal';
     } else if (S.pts.length < 4) txt += '  ·  ' + S.pts.length + '/4 points';
+    if (S.icc) {
+      txt += '  ·  ' + S.icc.name + (S.icc.bare ? ' (kept)' : ' → exported as sRGB');
+      info.title = S.icc.bare
+        ? 'The export carries the original colour profile, with unconverted pixel values.'
+        : S.icc.space !== 'RGB '
+          ? 'Only RGB profiles can be preserved — this one describes ' + S.icc.space.trim() + ' data.'
+          : 'This browser lacks CompressionStream, which embedding the profile needs.';
+    } else info.title = '';
     info.textContent = txt;
-  } else info.textContent = 'No image loaded';
+  } else { info.textContent = 'No image loaded'; info.title = ''; }
 
   var est = document.getElementById('est');
   if (guided) { guidedStatus(est); return; }
@@ -1087,19 +1282,49 @@ function baseName(name) {
 }
 
 function loadFile(file) {
-  S.f35 = null;
+  S.f35 = null; S.icc = null; S.file = file;
   S.name = baseName(file.name);
-  if (/jpe?g/i.test(file.type)) {
-    var fr = new FileReader();
-    fr.onload = function () {
-      S.f35 = exifFocal35(fr.result);
-      loadImage(URL.createObjectURL(file));
-    };
-    fr.onerror = function () { loadImage(URL.createObjectURL(file)); };
-    fr.readAsArrayBuffer(file);
-  } else {
+  var fr = new FileReader();
+  fr.onload = function () {
+    if (S.file !== file) return;
+    if (/jpe?g/i.test(file.type)) S.f35 = exifFocal35(fr.result);
     loadImage(URL.createObjectURL(file));
-  }
+    splitIcc(new Uint8Array(fr.result)).then(function (r) {
+      if (S.file !== file || !r) return;
+      var inf = iccInfo(r.icc);
+      if (!inf) return;
+      S.icc = {
+        data: r.icc, name: inf.name, space: inf.space,
+        // only RGB profiles fit an RGB PNG; grey or CMYK data is decoded to RGB by the browser anyway
+        bare: inf.space === 'RGB ' && ICC_OK ? new Blob([r.bare], { type: file.type }) : null
+      };
+      updateChrome();
+    });
+  };
+  fr.onerror = function () { if (S.file === file) loadImage(URL.createObjectURL(file)); };
+  fr.readAsArrayBuffer(file);
+}
+
+/* Decodes the profile-less copy of the source: the browser treats it as sRGB,
+   so the pixel values arrive exactly as stored in the file. */
+function rawSource(icc) {
+  return new Promise(function (resolve, reject) {
+    var url = URL.createObjectURL(icc.bare), img = new Image();
+    img.onload = function () {
+      URL.revokeObjectURL(url);
+      if (img.naturalWidth !== S.srcW || img.naturalHeight !== S.srcH) {
+        reject(new Error('unconverted copy decodes to a different size'));
+        return;
+      }
+      var c = document.createElement('canvas');
+      c.width = S.srcW; c.height = S.srcH;
+      var cc = c.getContext('2d', { willReadFrequently: true });
+      cc.drawImage(img, 0, 0);
+      resolve(cc.getImageData(0, 0, S.srcW, S.srcH));
+    };
+    img.onerror = function () { URL.revokeObjectURL(url); reject(new Error('unconverted copy does not decode')); };
+    img.src = url;
+  });
 }
 
 function loadImage(src) {
@@ -1489,29 +1714,78 @@ window.addEventListener('keydown', function (e) {
 
 // ------------------------------------------------------------------ Export
 
-document.getElementById('export').addEventListener('click', function () {
-  if (!S.rect) return;
+/* Renders the export canvas. raw = unconverted source pixels (profile kept),
+   or null for the colour-managed sRGB result shown on screen. */
+function renderExport(raw) {
   if (S.rectDirty) rebuildRect(false);
+  if (!S.rect) return null;
 
   var k = parseFloat(document.getElementById('expScale').value) || 1;
   var bb = warpBBox();
   var W = Math.max(1, Math.round(bb.w * k)), H = Math.max(1, Math.round(bb.h * k));
-  if (W > 12000 || H > 12000) { alert('Output too large (' + W + '×' + H + ').'); return; }
+  if (W > 12000 || H > 12000) { alert('Output too large (' + W + '×' + H + ').'); return null; }
 
+  var tex = raw ? rectify(1, raw) : S.rect;
+  if (!tex) return null;
   var out = document.createElement('canvas');
   out.width = W; out.height = H;
   var ctx = out.getContext('2d');
   ctx.imageSmoothingQuality = 'high';
   ctx.setTransform(k, 0, 0, k, -bb.x * k, -bb.y * k);
-  drawWarped(ctx, 64, 0.5 / k);
+  drawWarped(ctx, 64, 0.5 / k, tex);
+  return out;
+}
 
-  out.toBlob(function (blob) {
-    var a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = (S.name || 'anti-perspective') + '-AP.png';
-    a.click();
-    setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
-  }, 'image/png');
+function savePNG(blob) {
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = (S.name || 'anti-perspective') + '-AP.png';
+  a.click();
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+}
+
+function toBlobP(cv) {
+  return new Promise(function (resolve, reject) {
+    cv.toBlob(function (b) { if (b) resolve(b); else reject(new Error('PNG encoding failed')); }, 'image/png');
+  });
+}
+
+document.getElementById('export').addEventListener('click', function () {
+  if (!S.rect) return;
+  var icc = S.icc && S.icc.bare ? S.icc : null;
+
+  if (!icc) {
+    var out = renderExport(null);
+    if (out) toBlobP(out).then(savePNG);
+    return;
+  }
+
+  // Unconverted pixels + original profile. The values are only meaningful
+  // together with that profile, so a failure must never save them untagged.
+  expBtn.disabled = true;
+  expBtn.textContent = 'Exporting…';
+  rawSource(icc)
+    .then(function (raw) {
+      if (S.icc !== icc) throw new Error('another image was loaded meanwhile');
+      var cv = renderExport(raw);
+      if (!cv) return null;
+      return toBlobP(cv)
+        .then(function (b) { return b.arrayBuffer(); })
+        .then(function (buf) { return pngWithIcc(new Uint8Array(buf), icc.data, icc.name); })
+        .then(function (u8) { savePNG(new Blob([u8], { type: 'image/png' })); });
+    })
+    .catch(function (err) {
+      console.error(err);
+      if (confirm('The colour profile could not be preserved (' + err.message + ').\n' +
+                  'Export as sRGB instead?')) {
+        var cv = renderExport(null);
+        if (cv) return toBlobP(cv).then(savePNG);
+      }
+    })
+    .then(function () {
+      expBtn.textContent = 'Export PNG (transparent)';
+      updateChrome();
+    });
 });
 
 // ------------------------------------------------------------------ Start
