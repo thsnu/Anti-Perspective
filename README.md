@@ -13,8 +13,6 @@ component. Images never leave your machine; everything runs in the canvas of you
 <img width="2668" height="1792" alt="Screenshot1" src="https://github.com/user-attachments/assets/263dedee-c6dd-4281-802e-2236c7b7fc3a" />
 <img width="2672" height="1794" alt="Screenshot2" src="https://github.com/user-attachments/assets/f1ed205a-6f7d-46eb-9a76-e12706c150b2" />
 <img width="2668" height="1790" alt="Screenshot3" src="https://github.com/user-attachments/assets/5e743f2f-9f63-439d-a05f-d27e37477df1" />
-<img width="1920" height="1255" alt="sceeenshot2" src="https://github.com/user-attachments/assets/51ac73ad-cc1f-4a90-86cc-f9839070d2bb" />
-
 
 ---
 
@@ -53,6 +51,13 @@ visual outline of the shape, curves included.
 
 **Export.** PNG with a transparent background, cropped exactly to the bounding box of the warped
 shape, at 50 %, 100 % or 200 % scale.
+
+**Colour profiles.** If the source carries an embedded RGB colour profile — Display P3 from an
+iPhone or Mac, Adobe RGB, ProPhoto from Lightroom — the export keeps it: the PNG contains the
+original, unconverted pixel values together with that very profile, so nothing outside sRGB is
+clipped. The status bar shows the profile's name. Supported for JPEG, PNG and WebP; images without
+a profile, grey or CMYK profiles and other formats (HEIC, AVIF, TIFF) are exported as sRGB, as
+before. The panes themselves always show the colour-managed image. Output stays 8 bit per channel.
 
 ---
 
@@ -185,6 +190,11 @@ Then open <http://localhost:8731>.
   against the horizon and then sampled by the same inverse-mapping loop as corner mode.
 - **Export** re-renders the same mesh at a finer subdivision into an offscreen canvas sized to the
   shape's bounding box.
+- **Colour profiles.** Browsers colour-manage every decoded image into sRGB. To bypass that, the
+  export cuts the ICC profile out of a copy of the source file (JPEG APP2 segments, PNG `iCCP`,
+  WebP `ICCP`). The browser takes the untagged copy for sRGB and hands its pixels over unchanged;
+  they run through the same rectification and mesh, and the original profile is written back into
+  the PNG as an `iCCP` chunk.
 
 ---
 
